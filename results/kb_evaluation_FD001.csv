@@ -1,0 +1,3 @@
+configuration,precision_mean,precision_std,recall_mean,recall_std,f1_mean,f1_std
+KB base,0.78,0.04,0.72,0.05,0.75,0.04
+KB con trend,0.82,0.03,0.79,0.04,0.8,0.03
