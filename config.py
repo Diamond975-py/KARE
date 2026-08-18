@@ -1,67 +1,102 @@
 """
-Configurazione centrale di KARE.
-
-KARE = Knowledge-based Aircraft Risk & Engine Maintenance
-Dominio: diagnosi del degrado e pianificazione manutentiva su NASA C-MAPSS.
-
-Le soglie sono volutamente esplicite perché devono essere motivate nella relazione.
+config.py - Configurazione centralizzata per il framework KARE applicato
+alla Manutenzione Predittiva di Turbine Eoliche (Wind Turbine PHM).
 """
 
 from pathlib import Path
 
-# Dataset --------------------------------------------------------------------
-DEFAULT_SUBSET = "FD001"
-DATA_DIR_CANDIDATES = [
-    Path("data") / "CMAPSSData",
-    Path("data") / "CMAPSS",
-    Path("CMAPSSData"),
-    Path("CMAPSS"),
+# ==========================================
+# 1. PERCORSI E DIRECTORY
+# ==========================================
+BASE_DIR = Path(__file__).resolve().parent
+DATA_DIR = BASE_DIR / "data" / "WindTurbineData"
+RESULTS_DIR = BASE_DIR / "results"
+FIGURES_DIR = BASE_DIR / "figures_doc"
+DOCS_DIR = BASE_DIR / "docs"
+
+for directory in [DATA_DIR, RESULTS_DIR, FIGURES_DIR, DOCS_DIR]:
+    directory.mkdir(parents=True, exist_ok=True)
+
+# File Dataset
+TRAIN_DATA_FILE = DATA_DIR / "train_wind_turbines.csv"
+TEST_DATA_FILE = DATA_DIR / "test_wind_turbines.csv"
+
+# ==========================================
+# 2. DEFINIZIONE FEATURE E SENSORI SCADA
+# ==========================================
+ID_COL = "turbine_id"
+TIME_COL = "operating_hours"
+RUL_COL = "RUL"
+
+# Condizioni ambientali / operative
+OPERATIONAL_SETTINGS = [
+    "wind_speed_ms",
+    "ambient_temp_c",
+    "wind_direction_deg"
 ]
 
-# Feature engineering ---------------------------------------------------------
-WINDOW_SIZE = 20
-BASELINE_WINDOW = 20
-MAX_RUL_CAP = 125
+# Sensori di stato meccanico ed elettrico
+SENSORS = [
+    "gearbox_oil_temp_c",
+    "gearbox_bearing_temp_c",
+    "generator_winding_temp_c",
+    "generator_rpm",
+    "rotor_rpm",
+    "blade_pitch_angle_deg",
+    "hydraulic_pressure_bar",
+    "active_power_kw"
+]
 
-# Classi RUL: il target principale deriva dal Remaining Useful Life.
-# RUL > 80       -> healthy
-# 40 < RUL <= 80 -> warning
-# 15 < RUL <= 40 -> degraded
-# RUL <= 15      -> critical
-RUL_WARNING_THRESHOLD = 80
-RUL_DEGRADED_THRESHOLD = 40
-RUL_CRITICAL_THRESHOLD = 15
+ALL_FEATURES = OPERATIONAL_SETTINGS + SENSORS
 
-# Soglie per anomalie normalizzate rispetto alla baseline iniziale del motore.
-Z_ANOMALY = 2.0
-Z_CRITICAL = 3.0
-TREND_EPS = 0.02
-
-# Gruppi euristici di sensori.
-# C-MAPSS espone sensori numerici; qui li raggruppiamo come proxy diagnostici,
-# senza attribuire un significato fisico troppo specifico al singolo sensore.
-THERMAL_SENSORS = ["sensor_2", "sensor_3", "sensor_4", "sensor_8", "sensor_11", "sensor_13", "sensor_15"]
-PRESSURE_SENSORS = ["sensor_7", "sensor_11", "sensor_12", "sensor_20", "sensor_21"]
-ROTATION_SENSORS = ["sensor_9", "sensor_14"]
-
-# Rete Bayesiana --------------------------------------------------------------
-BAYES_PSEUDO_COUNTS = 1
-BAYES_TARGET = "FailureRisk"
-
-# CSP manutentivo -------------------------------------------------------------
-CSP_DAYS = 7
-CSP_SLOTS = ["morning", "afternoon"]
-CSP_TECHNICIANS = {
-    "tech_A": {"inspection", "repair"},
-    "tech_B": {"inspection", "repair", "replacement"},
-    "tech_C": {"inspection", "repair", "replacement"},
+# ==========================================
+# 3. SOGLIE FISICHE DI ALLARME (Knowledge Base)
+# ==========================================
+PHYSICAL_THRESHOLDS = {
+    # Temperature critiche (°C)
+    "gearbox_oil_max_safe": 80.0,
+    "gearbox_oil_alarm": 95.0,
+    "bearing_temp_alarm": 90.0,
+    "generator_winding_alarm": 120.0,
+    
+    # Pressione idraulica (bar)
+    "hydraulic_min_safe": 140.0,
+    "hydraulic_nominal": 180.0,
+    "hydraulic_max_safe": 210.0,
+    
+    # Efficienza / Rapporti critici
+    "min_power_curve_efficiency": 0.65,  # Potenza erogata rispetto alla curva teorica di potenza
+    "max_rpm_overspeed": 1850.0          # Max RPM generatore prima del blocco di sicurezza
 }
-CSP_ACTION_COSTS = {
-    "inspection": 1200,
-    "repair": 4200,
-    "replacement": 9000,
+
+# ==========================================
+# 4. STATI DI DEGRADO E SALUTE (Health Status)
+# ==========================================
+HEALTH_STATES = {
+    "HEALTHY": 0,    # Funzionamento regolare (RUL > 300 ore)
+    "WARNING": 1,    # Usura iniziale / Deriva termica (100 < RUL <= 300 ore)
+    "CRITICAL": 2    # Guasto imminente (RUL <= 100 ore)
 }
-CSP_DAILY_BUDGET = 16000
-CSP_MAX_ENGINES_PER_DAY = 4
-CSP_MAX_CANDIDATES = 8
-CSP_MAX_SOLUTIONS = 10
+
+RUL_EARLY_CUTOFF = 125.0  # Piece-wise linear RUL clipping (come in NASA C-MAPSS)
+CRITICAL_RUL_THRESHOLD = 100.0
+WARNING_RUL_THRESHOLD = 300.0
+
+# ==========================================
+# 5. FEATURE ENGINEERING (Finestre temporali)
+# ==========================================
+ROLLING_WINDOW_SIZE = 12  # Finestra mobile per media e deviazione standard (es. 12 step = 2 ore se a 10 min)
+ZSCORE_THRESHOLD = 2.5    # Soglia anomalia statistica su finestre mobili
+
+# ==========================================
+# 6. PARAMETRI OTTIMIZZATORE CSP (Manutenzione)
+# ==========================================
+CSP_CONFIG = {
+    "planning_horizon_days": 14,          # Orizzonte temporale di pianificazione
+    "max_crews_available": 3,              # Squadre di tecnici specializzati
+    "max_hours_per_shift": 8,              # Ore max lavorative per turno
+    "weather_wind_speed_limit_ms": 12.0,   # Limite vento per salita in navicella in sicurezza
+    "cost_preventive_intervention": 2500,  # Costo intervento pianificato (€)
+    "cost_corrective_intervention": 15000, # Costo intervento per fermo a guasto (€)
+    "cost_power_loss_per_hour": 350        # Perdita economica media per ora di fermo (€/h)
+}
