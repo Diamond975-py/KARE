@@ -1,418 +1,225 @@
 """
-bayesian_learner.py - Rete Bayesiana per rischio guasto/RUL class.
+bayesian_learner.py - Modulo di modellazione e inferenza probabilistica 
+basato su Reti Bayesiane per la stima dello stato di salute di turbine eoliche.
 
-La rete non sostituisce la Knowledge Base: usa anche gli output inferiti dalla
-KB come evidenza probabilistica.
+Ruoli del modulo:
+DAG Causale Strutturato: Modella le dipendenze fisiche (es. Vento -> Temperatura Olio -> Usura Cuscinetto -> Stato di Salute).
+
+Discretizzazione Intelligente: Mappa le grandezze continue SCADA in stati di allarme qualitativi coerenti con le soglie fisiche di config.py.
+
+Calcolo Probabilità e Failure Risk Score: Restituisce la distribuzione posteriore P(Stato | Sensori) e un indice di rischio composito continuo (failure_risk_score)
+compreso tra 0 e 1.0.
+
 """
 
-from __future__ import annotations
-
-import logging
-from typing import Any, Optional
-
+from typing import Dict, List, Tuple, Optional, Any
 import numpy as np
 import pandas as pd
-from pgmpy.estimators import BayesianEstimator, MaximumLikelihoodEstimator
-from pgmpy.inference import VariableElimination
-from pgmpy.models import DiscreteBayesianNetwork as BayesianNetwork
-from sklearn.metrics import accuracy_score, balanced_accuracy_score, f1_score
-from sklearn.model_selection import GroupKFold
-
 import config
-import data_loader
-import logic_engine
 
-logging.getLogger("pgmpy").setLevel(logging.ERROR)
-
-MODEL_CACHE: Optional[BayesianNetwork] = None
-STATE_NAMES_CACHE: dict[str, list[str]] = {}
-TARGET_CACHE: str = config.BAYES_TARGET
-
-EVIDENCE_COLUMNS = [
-    "OperatingRegime",
-    "SensorAnomalyLevel",
-    "ThermalState",
-    "PressureState",
-    "TrendState",
-    "KB_ThermalStress",
-    "KB_PressureInstability",
-    "KB_AdverseTrend",
-    "KB_DegradationEvidence",
-]
-
-RISK_ORDER = ["low", "medium", "high", "critical"]
-RUL_ORDER = ["healthy", "warning", "degraded", "critical"]
+try:
+    from pgmpy.models import BayesianNetwork
+    from pgmpy.estimators import MaximumLikelihoodEstimator, BayesianEstimator
+    from pgmpy.inference import VariableElimination
+    PGMPY_AVAILABLE = True
+except ImportError:
+    PGMPY_AVAILABLE = False
 
 
-def _yes_no(value: Any) -> str:
-    return "yes" if bool(value) else "no"
-
-
-def _ordered_states(values: pd.Series, target: Optional[str] = None) -> list[str]:
-    unique = [str(v) for v in values.dropna().unique()]
-    if target == "FailureRisk":
-        return [s for s in RISK_ORDER if s in unique] + sorted(set(unique) - set(RISK_ORDER))
-    if target == "RULClass":
-        return [s for s in RUL_ORDER if s in unique] + sorted(set(unique) - set(RUL_ORDER))
-    return sorted(unique)
-
-
-def prepare_bayes_dataframe(
-    df: Optional[pd.DataFrame] = None,
-    subset: str = config.DEFAULT_SUBSET,
-    data_dir: Optional[str] = None,
-    target: str = config.BAYES_TARGET,
-    use_kb: bool = True,
-) -> pd.DataFrame:
+class WindTurbineBayesianLearner:
     """
-    Converte il DataFrame C-MAPSS nel formato discreto richiesto da pgmpy.
-
-    Target ammessi:
-    - FailureRisk: low/medium/high/critical;
-    - RULClass: healthy/warning/degraded/critical.
+    Rete Bayesiana per la prognostica di salute delle turbine eoliche.
+    Struttura del DAG orientato causalmente:
+      [Vento / Stress Ambientale] -> [Stress Meccanico / Termico]
+      [Pressione Idraulica]       -> [Degrado Pitch]
+      [Stress Meccanico] + [Degrado Pitch] -> [Health State]
     """
 
-    if df is None:
-        df = data_loader.get_clean_data(subset=subset, data_dir=data_dir)
-
-    if use_kb and "kb_degradation_evidence" not in df.columns:
-        df = logic_engine.annotate_with_kb(df)
-
-    if target not in {"FailureRisk", "RULClass"}:
-        raise ValueError("target deve essere 'FailureRisk' oppure 'RULClass'")
-
-    if target == "FailureRisk":
-        if "failure_risk" not in df.columns:
-            raise ValueError("failure_risk mancante: usa split='train' o calcola RUL.")
-        target_values = df["failure_risk"].astype(str)
-    else:
-        if "rul_class" not in df.columns:
-            raise ValueError("rul_class mancante: usa split='train' o calcola RUL.")
-        target_values = df["rul_class"].astype(str)
-
-    data = pd.DataFrame(
-        {
-            "OperatingRegime": df["operating_regime"].astype(str),
-            "SensorAnomalyLevel": df["sensor_anomaly_level"].astype(str),
-            "ThermalState": df["thermal_state"].astype(str),
-            "PressureState": df["pressure_state"].astype(str),
-            "TrendState": df["trend_state"].astype(str),
-            "KB_ThermalStress": df["kb_thermal_stress"].apply(_yes_no),
-            "KB_PressureInstability": df["kb_pressure_instability"].apply(_yes_no),
-            "KB_AdverseTrend": df["kb_adverse_trend"].apply(_yes_no),
-            "KB_DegradationEvidence": df["kb_degradation_evidence"].apply(_yes_no),
-            target: target_values,
-            "engine_id": df["engine_id"].astype(int).values,
-            "record_id": df["record_id"].astype(str).values,
-        }
-    ).dropna()
-
-    if data[target].nunique() < 2:
-        raise ValueError("Il target contiene una sola classe: impossibile valutare il modello.")
-
-    return data
-
-
-def prepare_evidence_dataframe(
-    df: pd.DataFrame,
-    use_kb: bool = True,
-) -> pd.DataFrame:
-    """
-    Prepara solo le evidenze, senza richiedere il target.
-
-    Serve per predire su test set o su dati reali dove RUL/failure_risk non sono
-    noti.
-    """
-
-    if use_kb and "kb_degradation_evidence" not in df.columns:
-        df = logic_engine.annotate_with_kb(df)
-
-    data = pd.DataFrame(
-        {
-            "OperatingRegime": df["operating_regime"].astype(str),
-            "SensorAnomalyLevel": df["sensor_anomaly_level"].astype(str),
-            "ThermalState": df["thermal_state"].astype(str),
-            "PressureState": df["pressure_state"].astype(str),
-            "TrendState": df["trend_state"].astype(str),
-            "KB_ThermalStress": df["kb_thermal_stress"].apply(_yes_no),
-            "KB_PressureInstability": df["kb_pressure_instability"].apply(_yes_no),
-            "KB_AdverseTrend": df["kb_adverse_trend"].apply(_yes_no),
-            "KB_DegradationEvidence": df["kb_degradation_evidence"].apply(_yes_no),
-            "engine_id": df["engine_id"].astype(int).values,
-            "record_id": df["record_id"].astype(str).values,
-        }
-    ).dropna()
-
-    return data
-
-
-def _build_model(target: str = config.BAYES_TARGET) -> BayesianNetwork:
-    """
-    Struttura causale/diagnostica della rete.
-    """
-
-    return BayesianNetwork(
-        [
-            ("OperatingRegime", "SensorAnomalyLevel"),
-            ("SensorAnomalyLevel", "ThermalState"),
-            ("SensorAnomalyLevel", "PressureState"),
-            ("SensorAnomalyLevel", "TrendState"),
-            ("ThermalState", "KB_ThermalStress"),
-            ("PressureState", "KB_PressureInstability"),
-            ("TrendState", "KB_AdverseTrend"),
-            ("KB_ThermalStress", "KB_DegradationEvidence"),
-            ("KB_PressureInstability", "KB_DegradationEvidence"),
-            ("KB_AdverseTrend", "KB_DegradationEvidence"),
-            ("KB_DegradationEvidence", target),
-            ("SensorAnomalyLevel", target),
+    def __init__(self):
+        self.health_states = config.HEALTH_STATES
+        self.model: Optional[Any] = None
+        self.inference_engine: Optional[Any] = None
+        self.is_fitted = False
+        
+        # Nomi delle variabili discretizzate nel DAG Bayesiano
+        self.discrete_vars = [
+            "wind_regime",           # Basso, Nominale, Alto/Tempesta
+            "gearbox_thermal_state", # Normale, Alto, Critico
+            "bearing_stress",        # Normale, Alto
+            "hydraulic_status",      # Normale, Bassa Pressione
+            "power_efficiency",      # Efficiente, Bassa Efficienza
+            "health_state"           # 0=HEALTHY, 1=WARNING, 2=CRITICAL
         ]
-    )
 
+    def discretize_dataset(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Discretizza le variabili continue dei sensori SCADA in stati qualitativi finiti
+        per consentire l'apprendimento delle tabelle di probabilità condizionata (CPD).
+        """
+        df_disc = pd.DataFrame(index=df.index)
 
-def _state_names_for(data: pd.DataFrame, target: str) -> dict[str, list[str]]:
-    cols = EVIDENCE_COLUMNS + [target]
-    return {col: _ordered_states(data[col], target if col == target else None) for col in cols}
+        # 1. Regime del Vento
+        # 0: Basso (<6 m/s), 1: Nominale (6-13 m/s), 2: Alto/Turbolento (>13 m/s)
+        df_disc["wind_regime"] = pd.cut(
+            df["wind_speed_ms"],
+            bins=[-np.inf, 6.0, 13.0, np.inf],
+            labels=[0, 1, 2]
+        ).astype(int)
 
+        # 2. Stato Termico Moltiplicatore
+        # 0: Safe (<80°C), 1: Warning (80-95°C), 2: Critical (>=95°C)
+        df_disc["gearbox_thermal_state"] = pd.cut(
+            df["gearbox_oil_temp_c"],
+            bins=[-np.inf, config.PHYSICAL_THRESHOLDS["gearbox_oil_max_safe"], config.PHYSICAL_THRESHOLDS["gearbox_oil_alarm"], np.inf],
+            labels=[0, 1, 2]
+        ).astype(int)
 
-def train_model(
-    df: Optional[pd.DataFrame] = None,
-    subset: str = config.DEFAULT_SUBSET,
-    data_dir: Optional[str] = None,
-    target: str = config.BAYES_TARGET,
-    use_bayesian_estimator: bool = True,
-) -> BayesianNetwork:
-    """Addestra e mette in cache la rete bayesiana."""
+        # 3. Stress Cuscinetto (Bearing)
+        # 0: Normale (<90°C), 1: Alto (>=90°C)
+        df_disc["bearing_stress"] = (df["gearbox_bearing_temp_c"] >= config.PHYSICAL_THRESHOLDS["bearing_temp_alarm"]).astype(int)
 
-    global MODEL_CACHE, STATE_NAMES_CACHE, TARGET_CACHE
+        # 4. Stato Circuito Idraulico Pitch
+        # 0: Normale (>=140 bar), 1: Bassa Pressione (<140 bar)
+        df_disc["hydraulic_status"] = (df["hydraulic_pressure_bar"] < config.PHYSICAL_THRESHOLDS["hydraulic_min_safe"]).astype(int)
 
-    data = prepare_bayes_dataframe(df=df, subset=subset, data_dir=data_dir, target=target, use_kb=True)
-    train_data = data[EVIDENCE_COLUMNS + [target]].copy()
-    state_names = _state_names_for(train_data, target)
+        # 5. Efficienza della Curva di Potenza
+        theoretical_power = np.clip((df["wind_speed_ms"] ** 3) * 2.2, 1.0, 2000.0)
+        eff_ratio = df["active_power_kw"] / theoretical_power
+        df_disc["power_efficiency"] = (eff_ratio < config.PHYSICAL_THRESHOLDS["min_power_curve_efficiency"]).astype(int)
 
-    model = _build_model(target)
+        # Target: Health State
+        if "health_state" in df.columns:
+            df_disc["health_state"] = df["health_state"].astype(int)
 
-    if use_bayesian_estimator:
-        try:
-            model.fit(
-                train_data,
-                estimator=BayesianEstimator,
-                prior_type="dirichlet",
-                pseudo_counts=config.BAYES_PSEUDO_COUNTS,
-                state_names=state_names,
+        return df_disc
+
+    def define_network_structure(self) -> List[Tuple[str, str]]:
+        """
+        Definisce la topologia del Grafo Aciclico Diretto (DAG)
+        basata su causalità fisica tra condizioni operative e usura.
+        """
+        edges = [
+            ("wind_regime", "gearbox_thermal_state"),
+            ("wind_regime", "power_efficiency"),
+            ("gearbox_thermal_state", "bearing_stress"),
+            ("gearbox_thermal_state", "health_state"),
+            ("bearing_stress", "health_state"),
+            ("hydraulic_status", "health_state"),
+            ("power_efficiency", "health_state")
+        ]
+        return edges
+
+    def fit(self, df_train: pd.DataFrame) -> None:
+        """
+        Addestra i parametri della Rete Bayesiana stimando le CPD
+        tramite Maximum Likelihood / Bayesian Estimation con smoothing di Laplace.
+        """
+        df_disc = self.discretize_dataset(df_train)
+        edges = self.define_network_structure()
+
+        if PGMPY_AVAILABLE:
+            self.model = BayesianNetwork(edges)
+            # Stima Bayesiana con prior Dirichlet per evitare probabilità zero
+            self.model.fit(df_disc, estimator=BayesianEstimator, prior_type="BDeu", equivalent_sample_size=10)
+            self.inference_engine = VariableElimination(self.model)
+        else:
+            print("[WARN] pgmpy non installata. Utilizzo fallback euristico su frequenze congiunte.")
+            self._fit_fallback(df_disc)
+
+        self.is_fitted = True
+
+    def predict_health_probability(self, evidence: Dict[str, int]) -> Dict[str, float]:
+        """
+        Esegue l'inferenza probabilistica (Exact Variable Elimination)
+        calcolando P(health_state | Evidenza Sensori).
+        """
+        if not self.is_fitted:
+            raise RuntimeError("Il modello non è stato addestrato. Chiama fit() prima dell'inferenza.")
+
+        # Filtra l'evidenza solo sulle variabili del DAG escludendo la target
+        valid_evidence = {k: v for k, v in evidence.items() if k in self.discrete_vars and k != "health_state"}
+
+        if PGMPY_AVAILABLE and self.inference_engine is not None:
+            query_result = self.inference_engine.query(
+                variables=["health_state"],
+                evidence=valid_evidence,
+                show_progress=False
             )
-        except TypeError:
-            # Compatibilità con vecchie versioni pgmpy.
-            model.fit(
-                train_data,
-                estimator=BayesianEstimator,
-                prior_type="dirichlet",
-                pseudo_counts=config.BAYES_PSEUDO_COUNTS,
-            )
-    else:
-        model.fit(train_data, estimator=MaximumLikelihoodEstimator)
+            probs = query_result.values
+            return {
+                "P(HEALTHY)": float(probs[config.HEALTH_STATES["HEALTHY"]]),
+                "P(WARNING)": float(probs[config.HEALTH_STATES["WARNING"]]),
+                "P(CRITICAL)": float(probs[config.HEALTH_STATES["CRITICAL"]])
+            }
+        else:
+            return self._predict_fallback(valid_evidence)
 
-    MODEL_CACHE = model
-    STATE_NAMES_CACHE = state_names
-    TARGET_CACHE = target
-    return model
+    def evaluate_dataframe(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Calcola le probabilità di degrado e predice lo stato a massima verosimiglianza (MAP)
+        per ogni istante temporale.
+        """
+        df_disc = self.discretize_dataset(df)
+        results = []
 
+        for idx, row in df_disc.iterrows():
+            evidence = row.to_dict()
+            evidence.pop("health_state", None)
+            probs = self.predict_health_probability(evidence)
+            
+            # Criterio MAP (Maximum A Posteriori)
+            p_healthy = probs["P(HEALTHY)"]
+            p_warning = probs["P(WARNING)"]
+            p_critical = probs["P(CRITICAL)"]
+            
+            predicted_state = int(np.argmax([p_healthy, p_warning, p_critical]))
 
-def _clean_evidence(model: BayesianNetwork, evidence: dict[str, Any]) -> dict[str, str]:
-    """Rimuove evidenze non note al modello o stati non visti in training."""
+            results.append({
+                "bayes_pred_state": predicted_state,
+                "prob_healthy": round(p_healthy, 4),
+                "prob_warning": round(p_warning, 4),
+                "prob_critical": round(p_critical, 4),
+                "failure_risk_score": round(p_warning * 0.4 + p_critical * 1.0, 4)
+            })
 
-    clean: dict[str, str] = {}
-    for col, value in evidence.items():
-        if col not in EVIDENCE_COLUMNS:
-            continue
-        value = str(value)
-        cpd = model.get_cpds(col)
-        if cpd is None:
-            continue
-        known_states = set(cpd.state_names.get(col, []))
-        if value in known_states:
-            clean[col] = value
-    return clean
+        res_df = pd.DataFrame(results, index=df.index)
+        return pd.concat([df[[config.ID_COL, config.TIME_COL]], res_df], axis=1)
 
+    # --- Metodi di Fallback se pgmpy non è installata nell'ambiente ---
+    def _fit_fallback(self, df_disc: pd.DataFrame) -> None:
+        self.fallback_cpt = df_disc.groupby(["gearbox_thermal_state", "bearing_stress", "hydraulic_status", "power_efficiency"])["health_state"].value_counts(normalize=True).unstack(fill_value=0.0)
 
-def _probabilities_from_query(result, target: str) -> dict[str, float]:
-    states = [str(s) for s in result.state_names.get(target, [])]
-    values = np.asarray(result.values, dtype=float).ravel()
-    return {state: float(prob) for state, prob in zip(states, values)}
-
-
-def predict_failure_risk(
-    evidence: dict[str, Any],
-    model: Optional[BayesianNetwork] = None,
-    target: Optional[str] = None,
-) -> dict[str, Any]:
-    """
-    Predice la distribuzione del target per una singola evidenza.
-
-    Restituisce:
-    {
-        "prediction": classe più probabile,
-        "probabilities": {classe: probabilità}
-    }
-    """
-
-    global MODEL_CACHE
-
-    if model is None:
-        if MODEL_CACHE is None:
-            train_model(target=target or TARGET_CACHE)
-        model = MODEL_CACHE
-
-    target = target or TARGET_CACHE
-    infer = VariableElimination(model)
-    evidence = _clean_evidence(model, evidence)
-
-    if evidence:
-        result = infer.query(variables=[target], evidence=evidence, show_progress=False)
-    else:
-        result = infer.query(variables=[target], show_progress=False)
-
-    probs = _probabilities_from_query(result, target)
-    prediction = max(probs, key=probs.get)
-    return {"prediction": prediction, "probabilities": probs}
-
-
-def _evidence_from_prepared_row(row: pd.Series) -> dict[str, str]:
-    return {col: str(row[col]) for col in EVIDENCE_COLUMNS if col in row.index}
-
-
-def predict_dataframe(
-    df: pd.DataFrame,
-    model: Optional[BayesianNetwork] = None,
-    target: str = config.BAYES_TARGET,
-) -> pd.DataFrame:
-    """Aggiunge predizioni bayesiane a un DataFrame C-MAPSS."""
-
-    if "kb_degradation_evidence" not in df.columns:
-        df = logic_engine.annotate_with_kb(df)
-
-    prepared = prepare_evidence_dataframe(df=df, use_kb=False)
-
-    if model is None:
-        model = MODEL_CACHE
-        if model is None:
-            model = train_model(df=df, target=target)
-
-    predictions = []
-    probs_rows = []
-    for _, row in prepared.iterrows():
-        result = predict_failure_risk(_evidence_from_prepared_row(row), model=model, target=target)
-        predictions.append(result["prediction"])
-        probs_rows.append(result["probabilities"])
-
-    out = df.copy().reset_index(drop=True)
-    out[f"predicted_{target}"] = predictions
-
-    all_states = sorted({state for probs in probs_rows for state in probs})
-    for state in all_states:
-        out[f"prob_{target}_{state}"] = [probs.get(state, 0.0) for probs in probs_rows]
-
-    return out
-
-
-def _multiclass_brier(y_true: list[str], prob_rows: list[dict[str, float]], labels: list[str]) -> float:
-    total = 0.0
-    for true, probs in zip(y_true, prob_rows):
-        total += sum((probs.get(label, 0.0) - (1.0 if label == true else 0.0)) ** 2 for label in labels)
-    return float(total / max(len(y_true), 1))
-
-
-def _fit_fold_model(train_data: pd.DataFrame, target: str, state_names: dict[str, list[str]]) -> BayesianNetwork:
-    model = _build_model(target)
-    fit_data = train_data[EVIDENCE_COLUMNS + [target]].copy()
-    try:
-        model.fit(
-            fit_data,
-            estimator=BayesianEstimator,
-            prior_type="dirichlet",
-            pseudo_counts=config.BAYES_PSEUDO_COUNTS,
-            state_names=state_names,
+    def _predict_fallback(self, evidence: Dict[str, int]) -> Dict[str, float]:
+        key = (
+            evidence.get("gearbox_thermal_state", 0),
+            evidence.get("bearing_stress", 0),
+            evidence.get("hydraulic_status", 0),
+            evidence.get("power_efficiency", 0)
         )
-    except TypeError:
-        model.fit(
-            fit_data,
-            estimator=BayesianEstimator,
-            prior_type="dirichlet",
-            pseudo_counts=config.BAYES_PSEUDO_COUNTS,
-        )
-    return model
-
-
-def cross_validate_bayesian_network(
-    df: Optional[pd.DataFrame] = None,
-    subset: str = config.DEFAULT_SUBSET,
-    data_dir: Optional[str] = None,
-    k: int = 5,
-    target: str = config.BAYES_TARGET,
-    random_state: int = 42,  # mantenuto per coerenza API; GroupKFold non lo usa.
-) -> dict[str, float]:
-    """
-    Valuta la rete bayesiana con GroupKFold per evitare leakage tra cicli dello stesso motore.
-    """
-
-    del random_state
-
-    data = prepare_bayes_dataframe(df=df, subset=subset, data_dir=data_dir, target=target, use_kb=True)
-    groups = data["engine_id"].values
-    n_groups = len(np.unique(groups))
-    if n_groups < k:
-        raise ValueError(f"Impossibile usare k={k}: motori disponibili={n_groups}")
-
-    labels = _ordered_states(data[target], target)
-    state_names = _state_names_for(data[EVIDENCE_COLUMNS + [target]], target)
-
-    cv = GroupKFold(n_splits=k)
-
-    accuracies: list[float] = []
-    balanced_accuracies: list[float] = []
-    f1_macros: list[float] = []
-    briers: list[float] = []
-
-    for train_idx, test_idx in cv.split(data, data[target], groups):
-        train_data = data.iloc[train_idx].copy()
-        test_data = data.iloc[test_idx].copy()
-
-        model = _fit_fold_model(train_data, target, state_names)
-
-        y_true: list[str] = []
-        y_pred: list[str] = []
-        prob_rows: list[dict[str, float]] = []
-
-        for _, row in test_data.iterrows():
-            result = predict_failure_risk(_evidence_from_prepared_row(row), model=model, target=target)
-            y_true.append(str(row[target]))
-            y_pred.append(str(result["prediction"]))
-            prob_rows.append(result["probabilities"])
-
-        accuracies.append(accuracy_score(y_true, y_pred))
-        balanced_accuracies.append(balanced_accuracy_score(y_true, y_pred))
-        f1_macros.append(f1_score(y_true, y_pred, average="macro", labels=labels, zero_division=0))
-        briers.append(_multiclass_brier(y_true, prob_rows, labels))
-
-    results = {
-        "accuracy_mean": float(np.mean(accuracies)),
-        "accuracy_std": float(np.std(accuracies, ddof=1)),
-        "balanced_accuracy_mean": float(np.mean(balanced_accuracies)),
-        "balanced_accuracy_std": float(np.std(balanced_accuracies, ddof=1)),
-        "f1_macro_mean": float(np.mean(f1_macros)),
-        "f1_macro_std": float(np.std(f1_macros, ddof=1)),
-        "brier_mean": float(np.mean(briers)),
-        "brier_std": float(np.std(briers, ddof=1)),
-    }
-
-    print("\nRisultati Rete Bayesiana - GroupKFold CV")
-    print("------------------------------------------")
-    print(f"Accuracy:          {results['accuracy_mean']:.3f} ± {results['accuracy_std']:.3f}")
-    print(f"Balanced Accuracy: {results['balanced_accuracy_mean']:.3f} ± {results['balanced_accuracy_std']:.3f}")
-    print(f"F1-Macro:          {results['f1_macro_mean']:.3f} ± {results['f1_macro_std']:.3f}")
-    print(f"Brier Score:       {results['brier_mean']:.3f} ± {results['brier_std']:.3f}")
-
-    return results
+        if hasattr(self, "fallback_cpt") and key in self.fallback_cpt.index:
+            row = self.fallback_cpt.loc[key]
+            return {
+                "P(HEALTHY)": float(row.get(0, 0.33)),
+                "P(WARNING)": float(row.get(1, 0.33)),
+                "P(CRITICAL)": float(row.get(2, 0.34))
+            }
+        # Prior di default
+        return {"P(HEALTHY)": 0.60, "P(WARNING)": 0.30, "P(CRITICAL)": 0.10}
 
 
 if __name__ == "__main__":
-    cross_validate_bayesian_network(k=5)
+    print("--- Test Rete Bayesiana (bayesian_learner.py) ---")
+    import data_loader
+
+    # Carica dataset
+    data = data_loader.load_dataset()
+    
+    # Inizializza e addestra
+    learner = WindTurbineBayesianLearner()
+    learner.fit(data)
+    print("[OK] Rete Bayesiana addestrata con successo.")
+
+    # Inferenza su tutto il dataset
+    bayes_predictions = learner.evaluate_dataframe(data)
+    print("\nAnteprima predizioni probabilistiche e Rischio Guasto:")
+    print(bayes_predictions.head(8))
