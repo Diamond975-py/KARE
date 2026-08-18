@@ -1,6 +1,15 @@
 """
 data_loader.py - Modulo di caricamento, preprocessing, calcolo della RUL
 e generazione dati per il monitoraggio predittivo di turbine eoliche.
+
+Compiti principali del modulo:
+
+Generazione Automatica: Se non trova il file CSV nella cartella data/WindTurbineData/, ne genera uno fisicamente plausibile con 35 turbine,
+usura termica non lineare e profili di vento realistici.
+
+Calcolo RUL e Stati: Calcola la RUL esatta, la RUL_clipped (per stabilizzare i modelli predittivi) e la colonna health_state (HEALTHY, WARNING, CRITICAL).
+
+Feature Engineering: Calcola medie mobili, deviazioni standard e z-score per i sensori, essenziali per il motore logico e per la rete Bayesiana.
 """
 
 import numpy as np
