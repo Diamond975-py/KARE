@@ -1,303 +1,158 @@
 """
-data_loader.py - Loader e preprocessing per NASA C-MAPSS.
-
-Sostituisce il vecchio dominio degli esami con un dominio di manutenzione
-predittiva dei motori turbofan.
-
-Il loader produce un DataFrame già utilizzabile da:
-- Knowledge Base pyDatalog;
-- Rete Bayesiana pgmpy;
-- CSP di pianificazione manutentiva.
+data_loader.py - Modulo di caricamento, preprocessing, calcolo della RUL
+e generazione dati per il monitoraggio predittivo di turbine eoliche.
 """
-
-from __future__ import annotations
-
-import os
-from pathlib import Path
-from typing import Iterable, Optional
 
 import numpy as np
 import pandas as pd
-
+from typing import Tuple, Optional
+from pathlib import Path
 import config
 
-
-ID_COLUMNS = ["engine_id", "cycle"]
-SETTING_COLUMNS = [f"op_setting_{i}" for i in range(1, 4)]
-SENSOR_COLUMNS = [f"sensor_{i}" for i in range(1, 22)]
-CMAPSS_COLUMNS = ID_COLUMNS + SETTING_COLUMNS + SENSOR_COLUMNS
-
-
-def _project_root() -> Path:
-    return Path(__file__).resolve().parent
-
-
-def resolve_data_dir(data_dir: Optional[str | os.PathLike] = None) -> Path:
-    """
-    Trova la cartella che contiene i file C-MAPSS.
-
-    Ordine di ricerca:
-    1. parametro esplicito data_dir;
-    2. variabile d'ambiente CMAPSS_DATA_DIR;
-    3. data/CMAPSSData, data/CMAPSS, CMAPSSData, CMAPSS accanto ai .py.
-    """
-
-    candidates: list[Path] = []
-
-    if data_dir is not None:
-        candidates.append(Path(data_dir))
-
-    env_dir = os.getenv("CMAPSS_DATA_DIR")
-    if env_dir:
-        candidates.append(Path(env_dir))
-
-    root = _project_root()
-    candidates.extend(root / candidate for candidate in config.DATA_DIR_CANDIDATES)
-
-    for candidate in candidates:
-        if candidate.exists() and candidate.is_dir():
-            return candidate
-
-    tried = "\n - ".join(str(c) for c in candidates)
-    raise FileNotFoundError(
-        "Cartella C-MAPSS non trovata. Metti i file in data/CMAPSSData "
-        "oppure passa --data-dir. Percorsi provati:\n - " + tried
-    )
-
-
-def _subset_name(subset: str) -> str:
-    subset = str(subset).upper().replace("TRAIN_", "").replace("TEST_", "")
-    if not subset.startswith("FD"):
-        subset = f"FD{subset}"
-    return subset
-
-
-def load_cmapss_subset(
-    subset: str = config.DEFAULT_SUBSET,
-    split: str = "train",
-    data_dir: Optional[str | os.PathLike] = None,
+def generate_synthetic_wind_turbine_data(
+    num_turbines: int = 30,
+    max_operating_hours: int = 500,
+    seed: int = 42
 ) -> pd.DataFrame:
     """
-    Carica un file C-MAPSS, ad esempio train_FD001.txt.
-
-    Il file non ha header e contiene:
-    engine_id, cycle, 3 operational settings, 21 sensori.
+    Genera un dataset SCADA sintetico realistico con pattern di degrado
+    progressivo per moltiplicatore, cuscinetti e sistema idraulico.
     """
+    np.random.seed(seed)
+    records = []
+    
+    for t_id in range(1, num_turbines + 1):
+        turbine_name = f"WTG_{t_id:02d}"
+        lifetime = np.random.randint(250, max_operating_hours)
+        
+        # Stato iniziale dei componenti (piccole variazioni costruttive)
+        gearbox_base_temp = np.random.uniform(60.0, 68.0)
+        bearing_base_temp = np.random.uniform(55.0, 63.0)
+        hydraulic_base_press = np.random.uniform(180.0, 190.0)
+        
+        for hour in range(1, lifetime + 1):
+            # Profilo di vento con fluttuazioni stocastiche
+            wind_speed = np.clip(np.random.normal(loc=9.0, scale=2.5), 3.0, 25.0)
+            ambient_temp = np.random.normal(loc=18.0, scale=4.0)
+            wind_direction = (np.random.normal(loc=180.0, scale=15.0) + (hour * 0.1)) % 360
+            
+            # Dinamica di rotazione e potenza in base al vento
+            rotor_rpm = np.clip(wind_speed * 1.4 + np.random.normal(0, 0.2), 6.0, 20.0)
+            generator_rpm = rotor_rpm * 90.0  # Rapporto tipico moltiplicatore 1:90
+            active_power = np.clip((wind_speed ** 3) * 2.2 + np.random.normal(0, 15), 0, 2000)
+            blade_pitch = 0.0 if wind_speed < 12 else (wind_speed - 12) * 2.5
+            
+            # Dinamica di degrado non lineare (esponenziale verso fine vita)
+            degradation_factor = (hour / lifetime) ** 3.5
+            
+            # Sensori con deriva termica e usura idraulica
+            gearbox_oil_temp = gearbox_base_temp + (active_power / 100) * 0.8 + (degradation_factor * 35.0) + np.random.normal(0, 0.8)
+            gearbox_bearing_temp = bearing_base_temp + (generator_rpm / 300) * 1.1 + (degradation_factor * 32.0) + np.random.normal(0, 0.7)
+            generator_winding_temp = ambient_temp + 45.0 + (active_power / 80) * 1.5 + (degradation_factor * 40.0) + np.random.normal(0, 1.0)
+            hydraulic_pressure = hydraulic_base_press - (degradation_factor * 45.0) + np.random.normal(0, 1.5)
+            
+            records.append({
+                config.ID_COL: turbine_name,
+                config.TIME_COL: hour,
+                "wind_speed_ms": round(wind_speed, 2),
+                "ambient_temp_c": round(ambient_temp, 2),
+                "wind_direction_deg": round(wind_direction, 2),
+                "gearbox_oil_temp_c": round(gearbox_oil_temp, 2),
+                "gearbox_bearing_temp_c": round(gearbox_bearing_temp, 2),
+                "generator_winding_temp_c": round(generator_winding_temp, 2),
+                "generator_rpm": round(generator_rpm, 2),
+                "rotor_rpm": round(rotor_rpm, 2),
+                "blade_pitch_angle_deg": round(blade_pitch, 2),
+                "hydraulic_pressure_bar": round(hydraulic_pressure, 2),
+                "active_power_kw": round(active_power, 2)
+            })
+            
+    df = pd.DataFrame(records)
+    return df
 
-    subset = _subset_name(subset)
-    split = split.lower().strip()
-    if split not in {"train", "test"}:
-        raise ValueError("split deve essere 'train' oppure 'test'")
 
-    base_dir = resolve_data_dir(data_dir)
-    path = base_dir / f"{split}_{subset}.txt"
+def calculate_rul(df: pd.DataFrame, early_cutoff: Optional[float] = config.RUL_EARLY_CUTOFF) -> pd.DataFrame:
+    """
+    Calcola la RUL (Remaining Useful Life) in ore per ogni turbina.
+    RUL(t) = Max_Hours(Turbina) - Current_Hour(t)
+    Applica opzionalmente il piecewise linear clipping.
+    """
+    df_processed = df.copy()
+    
+    # Trova il ciclo massimo per ciascuna turbina
+    max_cycle_per_unit = df_processed.groupby(config.ID_COL)[config.TIME_COL].transform("max")
+    
+    # RUL lineare
+    df_processed[config.RUL_COL] = max_cycle_per_unit - df_processed[config.TIME_COL]
+    
+    # RUL clipped (Early Cutoff) per stabilizzare l'apprendimento
+    if early_cutoff is not None:
+        df_processed["RUL_clipped"] = df_processed[config.RUL_COL].clip(upper=early_cutoff)
+    else:
+        df_processed["RUL_clipped"] = df_processed[config.RUL_COL]
+        
+    # Assegna lo stato di salute discreto
+    def assign_health_state(rul):
+        if rul <= config.CRITICAL_RUL_THRESHOLD:
+            return config.HEALTH_STATES["CRITICAL"]
+        elif rul <= config.WARNING_RUL_THRESHOLD:
+            return config.HEALTH_STATES["WARNING"]
+        return config.HEALTH_STATES["HEALTHY"]
+        
+    df_processed["health_state"] = df_processed[config.RUL_COL].apply(assign_health_state)
+    
+    return df_processed
+
+
+def extract_rolling_features(df: pd.DataFrame, window_size: int = config.ROLLING_WINDOW_SIZE) -> pd.DataFrame:
+    """
+    Estrae statistiche a finestra mobile (media, std) e z-score
+    per catturare derive e anomalie transitorie.
+    """
+    df_features = df.copy()
+    
+    for sensor in config.SENSORS:
+        # Media mobile e deviazione standard per ciascuna turbina
+        rolling_mean = df_features.groupby(config.ID_COL)[sensor].transform(
+            lambda x: x.rolling(window=window_size, min_periods=1).mean()
+        )
+        rolling_std = df_features.groupby(config.ID_COL)[sensor].transform(
+            lambda x: x.rolling(window=window_size, min_periods=1).std().fillna(1e-4)
+        )
+        
+        df_features[f"{sensor}_roll_mean"] = rolling_mean
+        df_features[f"{sensor}_roll_std"] = rolling_std
+        df_features[f"{sensor}_zscore"] = (df_features[sensor] - rolling_mean) / rolling_std
+        
+    return df_features
+
+
+def load_dataset(data_path: Optional[Path] = None) -> pd.DataFrame:
+    """
+    Carica i dati SCADA dal disco o genera un dataset sintetico se non presente.
+    """
+    path = data_path or config.TRAIN_DATA_FILE
+    
     if not path.exists():
-        raise FileNotFoundError(f"File non trovato: {path}")
-
-    df = pd.read_csv(path, sep=r"\s+", header=None, names=CMAPSS_COLUMNS)
-    df = df.dropna(axis=1, how="all")
-
-    # Alcuni parser possono creare colonne extra se ci sono spazi finali anomali.
-    if len(df.columns) > len(CMAPSS_COLUMNS):
-        df = df.iloc[:, : len(CMAPSS_COLUMNS)]
-        df.columns = CMAPSS_COLUMNS
-
-    df["subset"] = subset
-    df["split"] = split
-    df["engine_id"] = df["engine_id"].astype(int)
-    df["cycle"] = df["cycle"].astype(int)
-
-    numeric_cols = SETTING_COLUMNS + SENSOR_COLUMNS
-    df[numeric_cols] = df[numeric_cols].apply(pd.to_numeric, errors="coerce")
-    df = df.dropna(subset=numeric_cols)
-
-    # Identificatore univoco di record: utile per KB e debug.
-    df["record_id"] = (
-        df["subset"].astype(str)
-        + "_E"
-        + df["engine_id"].astype(str)
-        + "_C"
-        + df["cycle"].astype(str)
-    )
-
-    return df
-
-
-def add_train_rul(df: pd.DataFrame, max_rul_cap: int = config.MAX_RUL_CAP) -> pd.DataFrame:
-    """
-    Calcola RUL sui dati di training.
-
-    Per ogni motore, l'ultimo ciclo osservato è considerato ciclo di guasto.
-    RUL = max_cycle_engine - cycle.
-    """
-
-    df = df.copy()
-    max_cycle = df.groupby("engine_id")["cycle"].transform("max")
-    df["max_cycle"] = max_cycle.astype(int)
-    df["rul"] = (max_cycle - df["cycle"]).astype(int)
-    df["rul_capped"] = df["rul"].clip(upper=max_rul_cap).astype(int)
-    df["rul_class"] = df["rul"].apply(classify_rul)
-    df["failure_risk"] = df["rul_class"].map(
-        {
-            "healthy": "low",
-            "warning": "medium",
-            "degraded": "high",
-            "critical": "critical",
-        }
-    )
-    df["urgent_label"] = (df["rul"] <= config.RUL_DEGRADED_THRESHOLD).astype(int)
-    return df
-
-
-def classify_rul(rul: float | int) -> str:
-    """Restituisce una classe simbolica di Remaining Useful Life."""
-
-    rul = float(rul)
-    if rul <= config.RUL_CRITICAL_THRESHOLD:
-        return "critical"
-    if rul <= config.RUL_DEGRADED_THRESHOLD:
-        return "degraded"
-    if rul <= config.RUL_WARNING_THRESHOLD:
-        return "warning"
-    return "healthy"
-
-
-def _safe_std(series: pd.Series) -> float:
-    value = float(series.std(ddof=0))
-    if np.isnan(value) or value < 1e-9:
-        return 1.0
-    return value
-
-
-def add_window_features(
-    df: pd.DataFrame,
-    window: int = config.WINDOW_SIZE,
-    baseline_window: int = config.BASELINE_WINDOW,
-) -> pd.DataFrame:
-    """
-    Crea feature rolling e anomalie normalizzate rispetto alla baseline iniziale.
-
-    Non usa il target RUL: questo evita leakage tra label e feature diagnostiche.
-    """
-
-    df = df.sort_values(["engine_id", "cycle"]).copy()
-
-    grouped = df.groupby("engine_id", group_keys=False)
-
-    for sensor in SENSOR_COLUMNS:
-        roll = grouped[sensor].rolling(window=window, min_periods=1)
-        df[f"{sensor}_roll_mean"] = roll.mean().reset_index(level=0, drop=True)
-        df[f"{sensor}_roll_std"] = roll.std(ddof=0).reset_index(level=0, drop=True).fillna(0.0)
-        df[f"{sensor}_trend"] = grouped[sensor].transform(
-            lambda s: (s - s.shift(window - 1)) / max(window - 1, 1)
-        ).fillna(0.0)
-
-        baseline_mean = grouped[sensor].transform(lambda s: float(s.head(baseline_window).mean()))
-        baseline_std = grouped[sensor].transform(lambda s: _safe_std(s.head(baseline_window)))
-        df[f"{sensor}_z"] = (df[f"{sensor}_roll_mean"] - baseline_mean) / baseline_std
-
-    return df
-
-
-def _count_abs_z(df: pd.DataFrame, sensors: Iterable[str], threshold: float) -> pd.Series:
-    cols = [f"{s}_z" for s in sensors]
-    return (df[cols].abs() >= threshold).sum(axis=1)
-
-
-def _count_negative_trends(df: pd.DataFrame, sensors: Iterable[str], eps: float) -> pd.Series:
-    cols = [f"{s}_trend" for s in sensors]
-    return (df[cols] <= -abs(eps)).sum(axis=1)
-
-
-def _state_from_count(count: int, moderate_at: int, severe_at: int) -> str:
-    if count >= severe_at:
-        return "severe"
-    if count >= moderate_at:
-        return "moderate"
-    if count > 0:
-        return "mild"
-    return "normal"
-
-
-def add_symbolic_features(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Trasforma feature numeriche in stati simbolici utili per KB e Bayes.
-    """
-
-    df = df.copy()
-
-    df["thermal_anomaly_count"] = _count_abs_z(df, config.THERMAL_SENSORS, config.Z_ANOMALY)
-    df["pressure_anomaly_count"] = _count_abs_z(df, config.PRESSURE_SENSORS, config.Z_ANOMALY)
-    df["rotation_anomaly_count"] = _count_abs_z(df, config.ROTATION_SENSORS, config.Z_ANOMALY)
-    df["critical_sensor_count"] = _count_abs_z(df, SENSOR_COLUMNS, config.Z_CRITICAL)
-    df["negative_trend_count"] = _count_negative_trends(df, SENSOR_COLUMNS, config.TREND_EPS)
-
-    df["thermal_state"] = df["thermal_anomaly_count"].apply(lambda x: _state_from_count(int(x), 2, 4))
-    df["pressure_state"] = df["pressure_anomaly_count"].apply(lambda x: _state_from_count(int(x), 2, 3))
-    df["rotation_state"] = df["rotation_anomaly_count"].apply(lambda x: _state_from_count(int(x), 1, 2))
-    df["trend_state"] = df["negative_trend_count"].apply(lambda x: _state_from_count(int(x), 5, 9))
-
-    total_anomalies = (
-        df["thermal_anomaly_count"]
-        + df["pressure_anomaly_count"]
-        + df["rotation_anomaly_count"]
-        + df["critical_sensor_count"]
-    )
-    df["sensor_anomaly_level"] = total_anomalies.apply(lambda x: _state_from_count(int(x), 4, 8))
-
-    # Regime operativo simbolico basato sui tre operational settings.
-    # Usiamo quantili robusti e pochi stati per evitare CPD troppo sparse.
-    op1 = df["op_setting_1"]
-    q1, q2 = op1.quantile([0.33, 0.66])
-    df["operating_regime"] = np.select(
-        [op1 <= q1, op1 <= q2],
-        ["low", "medium"],
-        default="high",
-    )
-
-    return df
-
-
-def get_clean_data(
-    subset: str = config.DEFAULT_SUBSET,
-    split: str = "train",
-    data_dir: Optional[str | os.PathLike] = None,
-    window: int = config.WINDOW_SIZE,
-) -> pd.DataFrame:
-    """
-    Entry point usato dagli altri moduli.
-
-    Per split='train' aggiunge anche RUL e target sperimentali.
-    """
-
-    df = load_cmapss_subset(subset=subset, split=split, data_dir=data_dir)
-
-    if split.lower() == "train":
-        df = add_train_rul(df)
-
-    df = add_window_features(df, window=window)
-    df = add_symbolic_features(df)
-
-    return df
-
-
-def get_latest_engine_state(df: Optional[pd.DataFrame] = None, **kwargs) -> pd.DataFrame:
-    """
-    Restituisce l'ultima osservazione disponibile per ogni motore.
-
-    È il formato naturale per il CSP, che deve pianificare interventi sui motori
-    nello stato più recente conosciuto.
-    """
-
-    if df is None:
-        df = get_clean_data(**kwargs)
-
-    idx = df.groupby("engine_id")["cycle"].idxmax()
-    latest = df.loc[idx].sort_values("engine_id").reset_index(drop=True)
-    return latest
+        print(f"[INFO] File {path} non trovato. Generazione dataset sintetico realistico in corso...")
+        df_raw = generate_synthetic_wind_turbine_data(num_turbines=35)
+        df_raw.to_csv(path, index=False)
+        print(f"[OK] Dataset salvato con successo in: {path}")
+    else:
+        df_raw = pd.read_csv(path)
+        
+    # Calcolo RUL e feature engineering
+    df_rul = calculate_rul(df_raw)
+    df_final = extract_rolling_features(df_rul)
+    
+    return df_final
 
 
 if __name__ == "__main__":
-    data = get_clean_data()
-    print(data.shape)
-    print(data[["engine_id", "cycle", "rul", "rul_class", "failure_risk", "sensor_anomaly_level"]].head())
+    # Test di funzionamento rapido
+    print("--- Test Esecuzione data_loader.py ---")
+    data = load_dataset()
+    print(f"Dimensioni dataset: {data.shape}")
+    print(f"Turbine totali: {data[config.ID_COL].nunique()}")
+    print("Anteprima colonne e RUL:")
+    print(data[[config.ID_COL, config.TIME_COL, "gearbox_oil_temp_c", "RUL", "health_state"]].head(8))
